@@ -6,6 +6,7 @@ import sys
 import os
 import re
 import json
+import time
 from datasets import load_dataset
 from transformers import AutoTokenizer, DataCollatorWithPadding
 from torch.utils.data import DataLoader
@@ -57,36 +58,43 @@ def extract_last_value(completion, pattern: re.Pattern):
     else:
         return INVALID_ANS
 
-def save_results(questions: list, predictions: list, labels: list, model_name: str, descriptor: str) -> str:
+def save_results(questions: list, predictions: list, labels: list, model_name: str, descriptor: str,
+                 wall_times: list = None, tokens_generated: list = None) -> str:
     """Save questions, predictions, and labels to a JSONL file.
-    
+
     Args:
         questions: List of question strings
         predictions: List of prediction strings
         labels: List of label strings
         model_name: Model name for output filename
         descriptor: Additional descriptor for filename
-        
+        wall_times: Optional per-question wall-clock times in seconds
+        tokens_generated: Optional per-question token counts
+
     Returns:
         Path to the saved output file
     """
     # Create output filename based on model name
     model_name_safe = model_name.replace("/", "_")
     output_file = f"results/{model_name_safe}_{descriptor}_predictions.jsonl"
-    
+
     # Ensure results directory exists
     os.makedirs("results", exist_ok=True)
-    
+
     # Write to JSONL
     with open(output_file, "w") as f:
-        for question, prediction, label in zip(questions, predictions, labels):
+        for i, (question, prediction, label) in enumerate(zip(questions, predictions, labels)):
             result = {
                 "question": question,
                 "prediction": prediction,
                 "label": label
             }
+            if wall_times is not None and i < len(wall_times):
+                result["wall_time"] = wall_times[i]
+            if tokens_generated is not None and i < len(tokens_generated):
+                result["tokens_generated"] = tokens_generated[i]
             f.write(json.dumps(result) + "\n")
-    
+
     return output_file
 
 def format_prompt(question: str, prompt_prefix: str = "", prompt_suffix: str = "") -> str:
@@ -131,26 +139,36 @@ def model_generate(config: dict):
     
     predictions = []
     questions = dataset["question"]
-    
+
+    measure_time = config.get("measure_time", False)
+    use_cuda = torch.cuda.is_available()
+    wall_times = []
+    tokens_generated = []
+
     print(f"Starting generation with {len(questions)} questions...")
     print(f"Using Eagle inference: {use_eagle_inference}")
     print(f"Generation params - temperature: {temperature}, top_p: {top_p}, max_new_tokens: {max_new_tokens}")
-    
+
     for i, question in enumerate(questions):
         if i % 50 == 0:
             print(f"Processing question {i+1}/{len(questions)}")
-            
+
         # Format the prompt
         prompt = format_prompt(question, prompt_prefix, prompt_suffix)
-        
+
         # Tokenize
         input_ids = model.tokenizer([prompt], return_tensors="pt").input_ids
-        
-        if torch.cuda.is_available():
+
+        if use_cuda:
             input_ids = input_ids.cuda()
-        
+
         # Generate with Eagle
         try:
+            if measure_time:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                t0 = time.perf_counter()
+
             if use_eagle_inference:
                 # Use Eagle's accelerated generation
                 generated_ids = model.ea_generate(
@@ -175,23 +193,32 @@ def model_generate(config: dict):
                 # naive_generate is also a generator, get the final result
                 for output_ids in generated_ids:
                     final_output_ids = output_ids
-            
+
             # Extract only the new tokens
             input_length = input_ids.shape[1]
             generated_tokens = final_output_ids[0, input_length:]
-            
+
+            if measure_time:
+                if use_cuda:
+                    torch.cuda.synchronize()
+                wall_times.append(time.perf_counter() - t0)
+                tokens_generated.append(len(generated_tokens))
+
             # Decode the generation
             generated_text = model.tokenizer.decode(generated_tokens, skip_special_tokens=True)
             predictions.append(generated_text)
-            
+
         except Exception as e:
             print(f"Error generating for question {i}: {e}")
             predictions.append("")
-    
+            if measure_time:
+                wall_times.append(0.0)
+                tokens_generated.append(0)
+
     # Get labels
     labels = dataset["answer"]
-    
-    return questions, predictions, labels
+
+    return questions, predictions, labels, wall_times, tokens_generated
 
 def main():
     # Huggingface login
@@ -214,9 +241,10 @@ def main():
     parser.add_argument('--save-results', action='store_true', help="Save detailed results")
     parser.add_argument('--prompt-prefix', type=str, default="", help="Prefix for prompts")
     parser.add_argument('--prompt-suffix', type=str, default="", help="Suffix for prompts")
-    parser.add_argument('--answer-pattern', type=str, default="numbers", 
+    parser.add_argument('--answer-pattern', type=str, default="numbers",
                         choices=list(ANSWER_PATTERNS.keys()), help="Pattern to extract answers")
-    
+    parser.add_argument('--measure-time', action='store_true', help="Measure and report wall-clock timing metrics")
+
     args = parser.parse_args()
 
     # Load config if provided, otherwise use command line args
@@ -239,7 +267,8 @@ def main():
             "depth": 7,
             "top_k": 10,
             "threshold": 1.0,
-            "is_llama3": "llama-3" in args.base_model_path.lower()
+            "is_llama3": "llama-3" in args.base_model_path.lower(),
+            "measure_time": args.measure_time,
         }
 
     print("Configuration:")
@@ -247,28 +276,43 @@ def main():
         print(f"  {key}: {value}")
 
     # Generate answers and extract labels
-    questions, predictions, labels = model_generate(config)
-    
+    questions, predictions, labels, wall_times, tokens_generated = model_generate(config)
+
     # Save results if requested
     if config.get("save_results", False):
         model_name = config["ea_model_path"].split("/")[-1]
-        output_file = save_results(questions, predictions, labels, model_name, "eagle_gsm8k")
+        output_file = save_results(
+            questions, predictions, labels, model_name, "eagle_gsm8k",
+            wall_times=wall_times if config.get("measure_time", False) else None,
+            tokens_generated=tokens_generated if config.get("measure_time", False) else None,
+        )
         print(f"Results saved to {output_file}")
 
     # Extract answers and report score
     pred_pattern = ANSWER_PATTERNS[config.get("answer_pattern", "numbers")]
     pred_answers = [extract_last_value(p, pred_pattern) for p in predictions]
     true_answers = [extract_value(l, ANSWER_PATTERNS['gsm8k']) for l in labels]
-    
+
     # Calculate metrics
     correct = sum(pred == true for pred, true in zip(pred_answers, true_answers))
     accuracy = correct / len(true_answers)
-    
+
     print(f"\nResults:")
     print(f"Total questions: {len(true_answers)}")
     print(f"Correct answers: {correct}")
     print(f"Eagle GSM8K accuracy: {accuracy:.2%}")
-    
+
+    # Timing metrics
+    if config.get("measure_time", False) and wall_times:
+        total_time = sum(wall_times)
+        total_tokens = sum(tokens_generated)
+        print(f"\nTiming:")
+        print(f"  Total generation time: {total_time:.2f}s")
+        print(f"  Total tokens generated: {total_tokens}")
+        if total_tokens > 0:
+            print(f"  Throughput: {total_tokens / total_time:.2f} tokens/s")
+            print(f"  Latency: {total_time / total_tokens * 1000:.2f} ms/token")
+
     # Show some examples
     print(f"\nSample predictions:")
     for i in range(min(3, len(predictions))):
