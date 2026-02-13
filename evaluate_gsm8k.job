@@ -1,0 +1,27 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --constraint=a100-80gb
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=12:00:00
+#SBATCH --account=jonmay_231
+#SBATCH --job-name=eagle_gsm8k_eval
+#SBATCH --output=eagle_gsm8k_eval_%j.out
+#SBATCH --mail-user=ryantlee@usc.edu
+
+module purge
+module load gcc/13.3
+module load cuda/12.6.3
+
+# Print GPU and CUDA details
+echo "===== GPU Details ====="
+nvidia-smi
+
+# Navigate to project directory
+cd /project2/jonmay_1426/eagle-cot
+
+# Run evaluation
+echo "===== Running Eagle GSM8K Evaluation ====="
+python evaluate.py
